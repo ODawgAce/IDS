@@ -1,0 +1,23 @@
+paths:
+  dumpcap: "C:/Program Files/Wireshark/dumpcap.exe"
+  java: "java"
+  cicflowmeter_jar: "C:/tools/CICFlowMeter/target/CICFlowMeterV3-0.0.4-SNAPSHOT.jar"
+  jnetpcap_jar: "C:/tools/jnetpcap-1.4.r1425/jnetpcap.jar"
+  jnetpcap_dll_dir: "C:/tools/jnetpcap-1.4.r1425"
+
+capture:
+  interface: "1"
+  rotate_seconds: 60
+  pcap_dir: "./runtime/pcaps"
+  flows_dir: "./runtime/flows"
+
+model:
+  rf_path: "./artifacts/rf.joblib"
+  lstm_path: "./artifacts/lstm.keras.best.keras"
+  meta_path: "./artifacts/meta.joblib"
+  preproc_path: "./artifacts/preproc.joblib"
+  seq_len: 20
+  alert_threshold: 0.50
+
+ui:
+  max_alert_rows: 500
