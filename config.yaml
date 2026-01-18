@@ -14,7 +14,6 @@ capture:
 model:
   rf_path: "./artifacts/rf.joblib"
   lstm_path: "./artifacts/lstm.keras.best.keras"
-  meta_path: "./artifacts/meta.joblib"
   preproc_path: "./artifacts/preproc.joblib"
   seq_len: 20
   alert_threshold: 0.50

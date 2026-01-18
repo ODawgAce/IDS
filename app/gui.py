@@ -2,18 +2,71 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
+import socket
 import tkinter as tk
-from tkinter import ttk
 from dataclasses import asdict
+from pathlib import Path
+from tkinter import ttk
 
-from app.worker import IDSWorker, WorkerConfig
+import psutil  # pip install psutil
+
 from app.detector import HybridDetector
+from app.worker import IDSWorker, WorkerConfig
+
+
+def _is_ipv4(addr: str) -> bool:
+    try:
+        socket.inet_aton(addr)
+        return True
+    except OSError:
+        return False
+
+
+def list_interfaces_pretty() -> list[tuple[str, str, str]]:
+    """
+    Zwraca listę (display, iface_name, ipv4)
+    display: tekst do comboboxa
+    iface_name: nazwa interfejsu do dumpcap -i
+    ipv4: najlepsze znalezione IPv4 (albo "")
+    """
+    out: list[tuple[str, str, str]] = []
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+
+    for name, addr_list in addrs.items():
+        st = stats.get(name)
+        is_up = bool(st.isup) if st else False
+
+        ipv4 = ""
+        for a in addr_list:
+            if getattr(a, "family", None) == socket.AF_INET and a.address and _is_ipv4(a.address):
+                if a.address != "127.0.0.1":
+                    ipv4 = a.address
+                    break
+                ipv4 = a.address
+
+        tag = "UP" if is_up else "DOWN"
+        if ipv4:
+            display = f"{name} — {ipv4} ({tag})"
+        else:
+            display = f"{name} — (no IPv4) ({tag})"
+
+        out.append((display, name, ipv4))
+
+    def key(t: tuple[str, str, str]) -> tuple[int, str]:
+        disp = t[0]
+        up = 0 if "(UP)" in disp else 1
+        return (up, disp.lower())
+
+    out.sort(key=key)
+    return out
 
 
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("IDS (RF + LSTM + Meta)")
+        self.title("IDS (RF + LSTM)")  # <- opcjonalnie: usunąłem "Meta" z tytułu
         self.geometry("1100x650")
 
         self.detector: HybridDetector | None = None
@@ -25,8 +78,14 @@ class MainWindow(tk.Tk):
         self.batch_count = 0
         self.alert_count = 0
 
+        self._iface_map: dict[str, str] = {}
+
         self._build_ui()
+        self._populate_interfaces()
         self._load_models()
+
+        self._auto_clean_batch_on_start()
+
         self.after(200, self._poll_queues)
 
     def _build_ui(self):
@@ -36,11 +95,14 @@ class MainWindow(tk.Tk):
         row = ttk.Frame(frm)
         row.pack(fill="x", padx=10, pady=8)
 
-        ttk.Label(row, text="Interfejs (dumpcap -i):").pack(side="left")
-        self.iface_var = tk.StringVar(value="1")
-        self.iface_box = ttk.Combobox(row, textvariable=self.iface_var, width=25, values=["1", "2", "3", "4"])
+        ttk.Label(row, text="Interfejs:").pack(side="left")
+
+        self.iface_var = tk.StringVar(value="")
+        self.iface_box = ttk.Combobox(row, textvariable=self.iface_var, width=55, state="readonly")
         self.iface_box.pack(side="left", padx=8)
-        ttk.Label(row, text="(np. 1 = Wi-Fi)").pack(side="left")
+
+        self.refresh_btn = ttk.Button(row, text="Odśwież", command=self._populate_interfaces)
+        self.refresh_btn.pack(side="left", padx=(8, 0))
 
         row2 = ttk.Frame(frm)
         row2.pack(fill="x", padx=10, pady=8)
@@ -62,7 +124,10 @@ class MainWindow(tk.Tk):
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
         self.stop_btn = ttk.Button(row3, text="Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(5, 5))
+
+        self.clear_btn = ttk.Button(row3, text="Wyczyść runtime", command=self.on_clear_runtime)
+        self.clear_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         stat = ttk.Frame(self)
         stat.pack(fill="x", padx=10, pady=(0, 10))
@@ -102,16 +167,35 @@ class MainWindow(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _populate_interfaces(self):
+        try:
+            items = list_interfaces_pretty()
+        except Exception as e:
+            items = []
+            self._append_log(f"ERROR: cannot list interfaces: {type(e).__name__}: {e}")
+
+        self._iface_map = {disp: name for disp, name, _ip in items}
+        values = list(self._iface_map.keys())
+        self.iface_box["values"] = values
+
+        if values:
+            chosen = values[0]
+            for disp, _name, ip in items:
+                if "(UP)" in disp and ip and ip != "127.0.0.1":
+                    chosen = disp
+                    break
+            self.iface_var.set(chosen)
+        else:
+            self.iface_var.set("")
+
     def _load_models(self):
         preproc = os.path.join("artifacts", "preproc.joblib")
         rf = os.path.join("artifacts", "rf.joblib")
         lstm = os.path.join("artifacts", "lstm.keras.best.keras")
-        meta = os.path.join("artifacts", "meta.joblib")
 
         self.detector = HybridDetector(
             rf_path=rf,
             lstm_path=lstm,
-            meta_path=meta,
             preproc_path=preproc,
             seq_len=20,
         )
@@ -119,13 +203,19 @@ class MainWindow(tk.Tk):
         self.status_var.set("Status: ready")
 
     def _make_config(self) -> WorkerConfig:
+        disp = self.iface_var.get().strip()
+        if not disp or disp not in self._iface_map:
+            raise RuntimeError("No interface selected.")
+
+        iface_name = self._iface_map[disp]
+
         return WorkerConfig(
             dumpcap_path=r"C:\Program Files\Wireshark\dumpcap.exe",
             java_bin="java",
             cicflow_jar=r"C:\tools\CICFlowMeter\target\CICFlowMeterV3-0.0.4-SNAPSHOT.jar",
             jnetpcap_jar=r"C:\tools\jnetpcap-1.4.r1425\jnetpcap.jar",
             jnetpcap_dll_dir=r"C:\tools\jnetpcap-1.4.r1425",
-            interface_index=int(self.iface_var.get()),
+            interface=iface_name,
             capture_seconds=int(self.cap_var.get()),
             threshold=float(self.thr_var.get()),
             seq_len=20,
@@ -136,6 +226,62 @@ class MainWindow(tk.Tk):
             batch_flows_dir="runtime/_batch/flows",
         )
 
+    # ---------- Runtime cleanup helpers ----------
+
+    def _clear_dir_contents(self, p: Path) -> int:
+        if not p.exists():
+            return 0
+
+        removed = 0
+        for item in p.glob("*"):
+            try:
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+                    removed += 1
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                    removed += 1
+            except Exception as e:
+                self._append_log(f"[WARN] Cannot remove {item}: {e}")
+        return removed
+
+    def _auto_clean_batch_on_start(self):
+        batch_dirs = [
+            Path("runtime/_batch/pcaps"),
+            Path("runtime/_batch/flows"),
+        ]
+
+        total = 0
+        for d in batch_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+            total += self._clear_dir_contents(d)
+
+        if total > 0:
+            self._append_log(f"[OK] Auto-clean: cleared runtime/_batch/* ({total} items removed)")
+        else:
+            self._append_log("[OK] Auto-clean: runtime/_batch/* already empty")
+
+    def on_clear_runtime(self):
+        if self.worker is not None:
+            self._append_log("[WARN] IDS is running. Stop it before cleaning runtime.")
+            return
+
+        dirs = [
+            Path("runtime/pcaps"),
+            Path("runtime/flows"),
+            Path("runtime/_batch/pcaps"),
+            Path("runtime/_batch/flows"),
+        ]
+
+        total = 0
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+            total += self._clear_dir_contents(d)
+
+        self._append_log(f"[OK] Runtime cleaned ({total} items removed)")
+
+    # ---------- Buttons ----------
+
     def on_start(self):
         if self.worker is not None:
             return
@@ -143,11 +289,19 @@ class MainWindow(tk.Tk):
             self._append_log("ERROR: detector is not loaded.")
             return
 
-        cfg = self._make_config()
+        try:
+            cfg = self._make_config()
+        except Exception as e:
+            self._append_log(f"ERROR: {e}")
+            return
+
         self._append_log(f"[INFO] Starting with config: {asdict(cfg)}")
         self.status_var.set("Status: running")
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.clear_btn.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
+        self.iface_box.configure(state="disabled")
 
         self.worker = IDSWorker(cfg=cfg, detector=self.detector, log_q=self.log_q, alert_q=self.alert_q)
         self.worker.start()
@@ -167,6 +321,9 @@ class MainWindow(tk.Tk):
         self.worker = None
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.clear_btn.configure(state="normal")
+        self.refresh_btn.configure(state="normal")
+        self.iface_box.configure(state="readonly")
         self.status_var.set("Status: ready")
 
     def _poll_queues(self):
@@ -185,7 +342,16 @@ class MainWindow(tk.Tk):
             while True:
                 a = self.alert_q.get_nowait()
                 self.alert_count += 1
-                self.tree.insert("", "end", values=(a.get("time"), f"{a.get('p_attack'):.4f}", a.get("source"), a.get("details")))
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        a.get("time"),
+                        f"{a.get('p_attack'):.4f}",
+                        a.get("source"),
+                        a.get("details"),
+                    ),
+                )
                 self.counters_var.set(f"Batches: {self.batch_count} | Alerts: {self.alert_count}")
         except queue.Empty:
             pass

@@ -25,7 +25,7 @@ class WorkerConfig:
     jnetpcap_jar: str
     jnetpcap_dll_dir: str
 
-    interface_index: int
+    interface: str
     capture_seconds: int = 10
 
     # próg dla SCORE (OR RF+LSTM) – u Ciebie sensownie 0.25–0.40
@@ -84,12 +84,12 @@ class IDSWorker(threading.Thread):
     def _run_dumpcap(self, out_pcap: str) -> None:
         cmd = [
             self.cfg.dumpcap_path,
-            "-i", str(self.cfg.interface_index),
+            "-i", str(self.cfg.interface),
             "-a", f"duration:{self.cfg.capture_seconds}",
             "-F", "pcap",
             "-w", out_pcap,
         ]
-        self._log(f"Capturing {self.cfg.capture_seconds}s on iface {self.cfg.interface_index} ...")
+        self._log(f"Capturing {self.cfg.capture_seconds}s on iface {self.cfg.interface} ...")
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     @staticmethod
@@ -194,8 +194,8 @@ class IDSWorker(threading.Thread):
                 # 5) sekwencje
                 X_seq = self._make_sequences(X_scaled, self.cfg.seq_len)
 
-                # 6) części + OUT
-                rf_p, lstm_p, meta_p = self.detector.predict_parts(X_scaled, X_seq)
+                # 6) części + OUT (OUT=RF w detektorze; LSTM osobno)
+                rf_p, lstm_p, _ = self.detector.predict_parts(X_scaled, X_seq)
                 out_p = self.detector.predict_proba(X_scaled, X_seq)
 
                 # 7) SCORE = RF na początku + soft-OR(RF, LSTM) dla części sekwencyjnej
@@ -209,7 +209,6 @@ class IDSWorker(threading.Thread):
                 # 8) log statystyk
                 self._log(self._stats_line("RF", rf_p))
                 self._log(self._stats_line("LSTM", lstm_p))
-                self._log(self._stats_line("META", meta_p))
                 self._log(self._stats_line("OUT", out_p))
                 self._log(self._stats_line("SCORE", score))
 
