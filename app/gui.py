@@ -4,16 +4,23 @@ import os
 import queue
 import shutil
 import socket
+import subprocess
 import tkinter as tk
 from dataclasses import asdict
 from pathlib import Path
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
-import psutil  # pip install psutil
+import psutil
 
 from app.detector import HybridDetector
 from app.worker import IDSWorker, WorkerConfig
+from app.path_utils import p, ensure_data_dirs
+from app.logging_utils import setup_logger
 
+
+# =========================================================
+# Helpers
+# =========================================================
 
 def _is_ipv4(addr: str) -> bool:
     try:
@@ -24,12 +31,6 @@ def _is_ipv4(addr: str) -> bool:
 
 
 def list_interfaces_pretty() -> list[tuple[str, str, str]]:
-    """
-    Zwraca listę (display, iface_name, ipv4)
-    display: tekst do comboboxa
-    iface_name: nazwa interfejsu do dumpcap -i
-    ipv4: najlepsze znalezione IPv4 (albo "")
-    """
     out: list[tuple[str, str, str]] = []
     addrs = psutil.net_if_addrs()
     stats = psutil.net_if_stats()
@@ -47,46 +48,72 @@ def list_interfaces_pretty() -> list[tuple[str, str, str]]:
                 ipv4 = a.address
 
         tag = "UP" if is_up else "DOWN"
-        if ipv4:
-            display = f"{name} — {ipv4} ({tag})"
-        else:
-            display = f"{name} — (no IPv4) ({tag})"
-
+        display = f"{name} — {ipv4} ({tag})" if ipv4 else f"{name} — (no IPv4) ({tag})"
         out.append((display, name, ipv4))
 
-    def key(t: tuple[str, str, str]) -> tuple[int, str]:
-        disp = t[0]
-        up = 0 if "(UP)" in disp else 1
-        return (up, disp.lower())
-
-    out.sort(key=key)
+    out.sort(key=lambda t: (0 if "(UP)" in t[0] else 1, t[0].lower()))
     return out
 
+
+def find_dumpcap() -> str | None:
+    env = os.environ.get("WIRESHARK_DUMPCAP")
+    if env and Path(env).exists():
+        return env
+
+    w = shutil.which("dumpcap")
+    if w and Path(w).exists():
+        return w
+
+    for c in (
+        r"C:\Program Files\Wireshark\dumpcap.exe",
+        r"C:\Program Files (x86)\Wireshark\dumpcap.exe",
+    ):
+        if Path(c).exists():
+            return c
+    return None
+
+
+# =========================================================
+# GUI
+# =========================================================
 
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("IDS (RF + LSTM)")  # <- opcjonalnie: usunąłem "Meta" z tytułu
+
+        self.title("IDS (RF + LSTM)")
         self.geometry("1100x650")
+
+        # ---- AppData dirs ----
+        self.dirs = ensure_data_dirs()
+        self.artifacts_root: Path = self.dirs["artifacts"]
+        self.runtime_root: Path = self.dirs["runtime"]
+
+        self.logger = setup_logger(str(self.dirs["logs"] / "app.log"))
+        self.logger.info("Start GUI")
 
         self.detector: HybridDetector | None = None
         self.worker: IDSWorker | None = None
 
-        self.log_q: "queue.Queue[str]" = queue.Queue()
-        self.alert_q: "queue.Queue[dict]" = queue.Queue()
+        self.log_q: queue.Queue[str] = queue.Queue()
+        self.alert_q: queue.Queue[dict] = queue.Queue()
 
         self.batch_count = 0
         self.alert_count = 0
+        self.models_ready = False
 
         self._iface_map: dict[str, str] = {}
 
         self._build_ui()
         self._populate_interfaces()
-        self._load_models()
-
+        self._try_load_models()
         self._auto_clean_batch_on_start()
 
         self.after(200, self._poll_queues)
+
+    # =====================================================
+    # UI
+    # =====================================================
 
     def _build_ui(self):
         frm = ttk.LabelFrame(self, text="Sterowanie")
@@ -98,39 +125,48 @@ class MainWindow(tk.Tk):
         ttk.Label(row, text="Interfejs:").pack(side="left")
 
         self.iface_var = tk.StringVar(value="")
-        self.iface_box = ttk.Combobox(row, textvariable=self.iface_var, width=55, state="readonly")
+        self.iface_box = ttk.Combobox(
+            row, textvariable=self.iface_var, width=55, state="readonly")
         self.iface_box.pack(side="left", padx=8)
 
-        self.refresh_btn = ttk.Button(row, text="Odśwież", command=self._populate_interfaces)
-        self.refresh_btn.pack(side="left", padx=(8, 0))
+        self.refresh_btn = ttk.Button(
+            row, text="Odśwież", command=self._populate_interfaces)
+        self.refresh_btn.pack(side="left")
 
         row2 = ttk.Frame(frm)
         row2.pack(fill="x", padx=10, pady=8)
 
         ttk.Label(row2, text="Próg alertu:").pack(side="left")
         self.thr_var = tk.DoubleVar(value=0.50)
-        self.thr_spin = ttk.Spinbox(row2, from_=0.0, to=1.0, increment=0.01, textvariable=self.thr_var, width=8)
-        self.thr_spin.pack(side="left", padx=8)
+        ttk.Spinbox(row2, from_=0, to=1, increment=0.01,
+                    textvariable=self.thr_var, width=8).pack(side="left", padx=8)
 
-        ttk.Label(row2, text="Czas batcha (s):").pack(side="left", padx=(20, 0))
+        ttk.Label(row2, text="Czas batcha (s):").pack(
+            side="left", padx=(20, 0))
         self.cap_var = tk.IntVar(value=60)
-        self.cap_spin = ttk.Spinbox(row2, from_=5, to=180, increment=5, textvariable=self.cap_var, width=6)
-        self.cap_spin.pack(side="left", padx=8)
+        ttk.Spinbox(row2, from_=5, to=180, increment=5,
+                    textvariable=self.cap_var, width=6).pack(side="left", padx=8)
 
         row3 = ttk.Frame(frm)
         row3.pack(fill="x", padx=10, pady=(0, 10))
 
         self.start_btn = ttk.Button(row3, text="Start", command=self.on_start)
-        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.start_btn.pack(side="left", expand=True, fill="x", padx=5)
 
-        self.stop_btn = ttk.Button(row3, text="Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(5, 5))
+        self.stop_btn = ttk.Button(
+            row3, text="Stop", command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", expand=True, fill="x", padx=5)
 
-        self.clear_btn = ttk.Button(row3, text="Wyczyść runtime", command=self.on_clear_runtime)
-        self.clear_btn.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.clear_btn = ttk.Button(
+            row3, text="Wyczyść runtime", command=self.on_clear_runtime)
+        self.clear_btn.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.download_btn = ttk.Button(
+            row3, text="Pobierz modele", command=self.on_download_models)
+        self.download_btn.pack(side="left", expand=True, fill="x", padx=5)
 
         stat = ttk.Frame(self)
-        stat.pack(fill="x", padx=10, pady=(0, 10))
+        stat.pack(fill="x", padx=10)
 
         self.status_var = tk.StringVar(value="Status: idle")
         ttk.Label(stat, textvariable=self.status_var).pack(side="left")
@@ -139,10 +175,10 @@ class MainWindow(tk.Tk):
         ttk.Label(stat, textvariable=self.counters_var).pack(side="right")
 
         log_frm = ttk.LabelFrame(self, text="Log")
-        log_frm.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        log_frm.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.log_text = tk.Text(log_frm, height=12)
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
+        self.log_text = tk.Text(log_frm, height=10)
+        self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
         alert_frm = ttk.LabelFrame(self, text="Alerty")
@@ -150,212 +186,171 @@ class MainWindow(tk.Tk):
 
         cols = ("time", "p_attack", "source", "details")
         self.tree = ttk.Treeview(alert_frm, columns=cols, show="headings")
-        self.tree.heading("time", text="Czas")
-        self.tree.heading("p_attack", text="P(attack)")
-        self.tree.heading("source", text="Źródło")
-        self.tree.heading("details", text="Szczegóły")
+        for c in cols:
+            self.tree.heading(c, text=c)
+        self.tree.pack(fill="both", expand=True)
 
-        self.tree.column("time", width=90, anchor="w")
-        self.tree.column("p_attack", width=90, anchor="w")
-        self.tree.column("source", width=320, anchor="w")
-        self.tree.column("details", width=520, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+    # =====================================================
+    # MODELS
+    # =====================================================
+
+    def _try_load_models(self):
+        try:
+            self.detector = HybridDetector(
+                rf_path=str(self.artifacts_root / "rf.joblib"),
+                lstm_path=str(self.artifacts_root / "lstm.keras.best.keras"),
+                preproc_path=str(self.artifacts_root / "preproc.joblib"),
+                seq_len=20,
+            )
+            self.models_ready = True
+            self.status_var.set("Status: ready")
+            self._append_log("[OK] Models loaded.")
+
+        except Exception as e:
+            self.models_ready = False
+            self.detector = None
+            self.status_var.set("Status: models missing")
+            self._append_log(f"[ERROR] Models not loaded: {e}")
+
+    def on_download_models(self):
+        ps1 = Path(p("scripts", "download_models.ps1"))
+        subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File",
+                str(ps1), "-TargetDir", str(self.artifacts_root)],
+            check=False,
+        )
+        self._try_load_models()
+
+    # =====================================================
+    # REST – runtime, worker, queues
+    # =====================================================
 
     def _append_log(self, line: str):
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", line.rstrip() + "\n")
+        self.log_text.insert("end", line + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        self.logger.info(line)
 
     def _populate_interfaces(self):
-        try:
-            items = list_interfaces_pretty()
-        except Exception as e:
-            items = []
-            self._append_log(f"ERROR: cannot list interfaces: {type(e).__name__}: {e}")
+        items = list_interfaces_pretty()
+        self._iface_map = {d: n for d, n, _ in items}
+        self.iface_box["values"] = list(self._iface_map.keys())
+        if items:
+            self.iface_var.set(items[0][0])
 
-        self._iface_map = {disp: name for disp, name, _ip in items}
-        values = list(self._iface_map.keys())
-        self.iface_box["values"] = values
+    def _auto_clean_batch_on_start(self):
+        for d in (
+            self.runtime_root / "_batch" / "pcaps",
+            self.runtime_root / "_batch" / "flows",
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True, exist_ok=True)
 
-        if values:
-            chosen = values[0]
-            for disp, _name, ip in items:
-                if "(UP)" in disp and ip and ip != "127.0.0.1":
-                    chosen = disp
-                    break
-            self.iface_var.set(chosen)
-        else:
-            self.iface_var.set("")
+    def on_clear_runtime(self):
+        if self.worker:
+            return
+        shutil.rmtree(self.runtime_root, ignore_errors=True)
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self._append_log("[OK] Runtime cleaned")
 
-    def _load_models(self):
-        preproc = os.path.join("artifacts", "preproc.joblib")
-        rf = os.path.join("artifacts", "rf.joblib")
-        lstm = os.path.join("artifacts", "lstm.keras.best.keras")
+    def on_start(self):
+        if not self.models_ready:
+            messagebox.showerror("Błąd", "Modele niezaładowane")
+            return
 
-        self.detector = HybridDetector(
-            rf_path=rf,
-            lstm_path=lstm,
-            preproc_path=preproc,
-            seq_len=20,
-        )
-        self._append_log("[OK] Models loaded.")
-        self.status_var.set("Status: ready")
+        iface = self._iface_map.get(self.iface_var.get())
+        dumpcap = find_dumpcap()
+        if not iface or not dumpcap:
+            messagebox.showerror("Błąd", "Brak dumpcap lub interfejsu")
+            return
 
-    def _make_config(self) -> WorkerConfig:
-        disp = self.iface_var.get().strip()
-        if not disp or disp not in self._iface_map:
-            raise RuntimeError("No interface selected.")
-
-        iface_name = self._iface_map[disp]
-
-        return WorkerConfig(
-            dumpcap_path=r"C:\Program Files\Wireshark\dumpcap.exe",
+        cfg = WorkerConfig(
+            dumpcap_path=dumpcap,
             java_bin="java",
-            cicflow_jar=r"C:\tools\CICFlowMeter\target\CICFlowMeterV3-0.0.4-SNAPSHOT.jar",
-            jnetpcap_jar=r"C:\tools\jnetpcap-1.4.r1425\jnetpcap.jar",
-            jnetpcap_dll_dir=r"C:\tools\jnetpcap-1.4.r1425",
-            interface=iface_name,
+            cicflow_jar=p("tools", "cicflowmeter",
+                          "CICFlowMeterV3-0.0.4-SNAPSHOT.jar"),
+            jnetpcap_jar=p("tools", "jnetpcap", "jnetpcap.jar"),
+            jnetpcap_dll_dir=p("tools", "jnetpcap"),
+            interface=iface,
             capture_seconds=int(self.cap_var.get()),
             threshold=float(self.thr_var.get()),
             seq_len=20,
-            runtime_dir="runtime",
-            pcap_dir="runtime/pcaps",
-            flows_dir="runtime/flows",
-            batch_pcap_dir="runtime/_batch/pcaps",
-            batch_flows_dir="runtime/_batch/flows",
+            runtime_dir=str(self.runtime_root),
+            pcap_dir=str(self.runtime_root / "pcaps"),
+            flows_dir=str(self.runtime_root / "flows"),
+            batch_pcap_dir=str(self.runtime_root / "_batch" / "pcaps"),
+            batch_flows_dir=str(self.runtime_root / "_batch" / "flows"),
         )
 
-    # ---------- Runtime cleanup helpers ----------
-
-    def _clear_dir_contents(self, p: Path) -> int:
-        if not p.exists():
-            return 0
-
-        removed = 0
-        for item in p.glob("*"):
-            try:
-                if item.is_file() or item.is_symlink():
-                    item.unlink()
-                    removed += 1
-                elif item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-                    removed += 1
-            except Exception as e:
-                self._append_log(f"[WARN] Cannot remove {item}: {e}")
-        return removed
-
-    def _auto_clean_batch_on_start(self):
-        batch_dirs = [
-            Path("runtime/_batch/pcaps"),
-            Path("runtime/_batch/flows"),
-        ]
-
-        total = 0
-        for d in batch_dirs:
-            d.mkdir(parents=True, exist_ok=True)
-            total += self._clear_dir_contents(d)
-
-        if total > 0:
-            self._append_log(f"[OK] Auto-clean: cleared runtime/_batch/* ({total} items removed)")
-        else:
-            self._append_log("[OK] Auto-clean: runtime/_batch/* already empty")
-
-    def on_clear_runtime(self):
-        if self.worker is not None:
-            self._append_log("[WARN] IDS is running. Stop it before cleaning runtime.")
-            return
-
-        dirs = [
-            Path("runtime/pcaps"),
-            Path("runtime/flows"),
-            Path("runtime/_batch/pcaps"),
-            Path("runtime/_batch/flows"),
-        ]
-
-        total = 0
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
-            total += self._clear_dir_contents(d)
-
-        self._append_log(f"[OK] Runtime cleaned ({total} items removed)")
-
-    # ---------- Buttons ----------
-
-    def on_start(self):
-        if self.worker is not None:
-            return
-        if self.detector is None:
-            self._append_log("ERROR: detector is not loaded.")
-            return
-
-        try:
-            cfg = self._make_config()
-        except Exception as e:
-            self._append_log(f"ERROR: {e}")
-            return
-
-        self._append_log(f"[INFO] Starting with config: {asdict(cfg)}")
-        self.status_var.set("Status: running")
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.clear_btn.configure(state="disabled")
-        self.refresh_btn.configure(state="disabled")
-        self.iface_box.configure(state="disabled")
-
-        self.worker = IDSWorker(cfg=cfg, detector=self.detector, log_q=self.log_q, alert_q=self.alert_q)
+        self.worker = IDSWorker(cfg, self.detector, self.log_q, self.alert_q)
         self.worker.start()
 
+        # --- NOWY KOD: Zarządzanie stanem przycisków ---
+        self.start_btn.configure(state="disabled")   # Zablokuj Start
+        self.stop_btn.configure(state="normal")      # Odblokuj Stop
+        # Zablokuj czyszczenie podczas pracy
+        self.clear_btn.configure(state="disabled")
+        self.status_var.set("Status: Running...")
+        self._append_log("[INFO] Worker started.")
+
     def on_stop(self):
-        if self.worker is None:
-            return
-
-        self._append_log("[INFO] Stopping IDS...")
-        self.status_var.set("Status: stopping...")
-
-        try:
+        if self.worker:
             self.worker.stop()
-        except Exception:
-            pass
+            self.worker = None
 
-        self.worker = None
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.clear_btn.configure(state="normal")
-        self.refresh_btn.configure(state="normal")
-        self.iface_box.configure(state="readonly")
-        self.status_var.set("Status: ready")
+        # --- NOWY KOD: Przywracanie przycisków ---
+        self.stop_btn.configure(state="disabled")    # Zablokuj Stop
+        self.start_btn.configure(state="normal")     # Odblokuj Start
+        self.clear_btn.configure(state="normal")     # Odblokuj czyszczenie
+        self.status_var.set("Status: Stopped")
+        self._append_log("[INFO] Worker stopped.")
 
     def _poll_queues(self):
+        # 1. Odbieranie LOGÓW (To już było)
         try:
             while True:
                 msg = self.log_q.get_nowait()
                 self._append_log(msg)
 
-                if msg.startswith("[OK] capture_"):
+                # Mały bonus: Zliczanie batchy na podstawie logów
+                if "Generating flows" in msg:
                     self.batch_count += 1
-                    self.counters_var.set(f"Batches: {self.batch_count} | Alerts: {self.alert_count}")
+                    self.counters_var.set(
+                        f"Batches: {self.batch_count} | Alerts: {self.alert_count}")
         except queue.Empty:
             pass
 
+        # 2. Odbieranie ALERTÓW (Tego brakowało!)
         try:
             while True:
-                a = self.alert_q.get_nowait()
+                # Wyciągnij alert z kolejki
+                alert = self.alert_q.get_nowait()
                 self.alert_count += 1
-                self.tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        a.get("time"),
-                        f"{a.get('p_attack'):.4f}",
-                        a.get("source"),
-                        a.get("details"),
-                    ),
+
+                # Przygotuj dane do tabeli
+                # alert["p_attack"] może być numpy.float, więc rzutujemy na float
+                p_val = float(alert["p_attack"])
+
+                values = (
+                    alert["time"],
+                    f"{p_val:.4f}",     # Formatowanie np. 0.9982
+                    alert["source"],
+                    alert["details"]
                 )
-                self.counters_var.set(f"Batches: {self.batch_count} | Alerts: {self.alert_count}")
+
+                # Wstaw na samą górę tabeli (index 0)
+                self.tree.insert("", 0, values=values)
+
+                # Zaktualizuj licznik na dole
+                self.counters_var.set(
+                    f"Batches: {self.batch_count} | Alerts: {self.alert_count}")
+
         except queue.Empty:
             pass
 
+        # Zapętl funkcję co 200ms
         self.after(200, self._poll_queues)
 
 
