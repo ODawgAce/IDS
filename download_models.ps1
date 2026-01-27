@@ -1,8 +1,9 @@
 param(
   [string]$Owner = "ODawgAce",
   [string]$Repo  = "IDS",
-  [string]$Tag   = "latest",      # np. "v1.0.0" albo "latest"
-  [string]$OutDir = "artifacts"
+  [string]$Tag   = "latest",
+  [string]$InstallDir = "",  # jeśli puste: użyje katalogu skryptu jako fallback
+  [string]$TargetDir = ""    # jeśli podane: zapisze modele bezpośrednio do tego folderu
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,14 +39,24 @@ function Get-ReleaseJson() {
   return Invoke-RestMethod -Uri $api -Headers $headers
 }
 
+# ---- resolve OutDir ----
+if (-not [string]::IsNullOrWhiteSpace($TargetDir)) {
+  $OutDir = (Resolve-Path $TargetDir -ErrorAction SilentlyContinue)
+  if (-not $OutDir) { $OutDir = $TargetDir }
+} else {
+  if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    # jeśli uruchamiane z instalatora: {app}\scripts\download_models.ps1 => InstallDir = {app}
+    $InstallDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+  }
+  $OutDir = Join-Path $InstallDir "artifacts"
+}
 Ensure-Dir $OutDir
 
+# META USUNIĘTA
 $need = @(
   "preproc.joblib",
   "rf.joblib",
-  "lstm.keras",
-  "lstm.keras.best.keras",
-  "meta.joblib"
+  "lstm.keras.best.keras"
 )
 
 Write-Host "[*] Fetching release info: $Owner/$Repo tag=$Tag"
@@ -71,11 +82,15 @@ if ($missing.Count -gt 0) {
 }
 
 foreach ($f in $need) {
-  $url = $assetsByName[$f].browser_download_url
   $dest = Join-Path $OutDir $f
+  if (Test-Path $dest) {
+    Write-Host "[OK] Exists, skipping: $dest"
+    continue
+  }
+  $url = $assetsByName[$f].browser_download_url
   Download-File $url $dest
 }
 
 Write-Host ""
-Write-Host "[OK] Models downloaded to: $OutDir"
+Write-Host "[OK] Models ready in: $OutDir"
 Get-ChildItem $OutDir | Select-Object Name, Length | Format-Table -AutoSize
