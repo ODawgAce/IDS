@@ -15,6 +15,7 @@ import pandas as pd
 from app.detector import HybridDetector
 from app.flowmeter import run_cicflowmeter, newest_csv
 from app.preprocess import clean_flow_df, align_to_feature_cols
+from app.path_utils import p
 
 
 @dataclass
@@ -171,6 +172,7 @@ class IDSWorker(threading.Thread):
                     jnetpcap_dll_dir=self.cfg.jnetpcap_dll_dir,
                     pcap_dir=self.cfg.batch_pcap_dir,
                     out_dir=self.cfg.batch_flows_dir,
+                    cicflow_lib_dir=p("tools", "cicflowmeter", "lib"),
                 )
 
                 # 3) newest csv z batcha
