@@ -5,7 +5,7 @@ import numpy as np
 def build_sliding_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
     """
     (N, F) -> (N-seq_len+1, seq_len, F)
-    Spójne z treningiem LSTM/meta.
+    Spójne z treningiem LSTM.
     """
     n, f = X.shape
     if n < seq_len:
@@ -18,5 +18,5 @@ def build_sliding_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
     except Exception:
         out = np.zeros((n - seq_len + 1, seq_len, f), dtype=np.float32)
         for i in range(n - seq_len + 1):
-            out[i] = X[i : i + seq_len]
+            out[i] = X[i: i + seq_len]
         return out
