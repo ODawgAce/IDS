@@ -1,56 +1,103 @@
 from __future__ import annotations
 
-import joblib
+import logging
 import numpy as np
-from tensorflow import keras
+import joblib                  # <--- PRZENIESIONE NA GÓRĘ
+from tensorflow import keras   # <--- PRZENIESIONE NA GÓRĘ
 
+print("### NEW DETECTOR LOADED ###")
 
-def _unwrap_preproc(obj):
-    if isinstance(obj, dict):
-        preproc = obj.get("preproc", None)
-        feature_cols = obj.get("feature_cols", None)
-        if preproc is None:
-            raise TypeError("preproc.joblib dict must contain key 'preproc'")
-        return preproc, feature_cols
-    return obj, None
+logger = logging.getLogger("IDS")
+
+# Funkcja _unwrap_preproc usunięta, logika przeniesiona do klasy
 
 
 class HybridDetector:
     """
     Wersja bez META:
       - RF + LSTM
-      - predict_parts zwraca (rf_p_full, lstm_p_seq, None)
-      - predict_proba zwraca RF (żeby nie mieszać logiki workerowi),
-        a worker i tak liczy SCORE soft-OR(RF, LSTM).
+      - predict_parts -> (rf_p_full, lstm_p_seq, None)
+      - predict_proba -> tylko RF
+        (worker liczy SCORE jako soft-OR(RF, LSTM))
     """
 
-    def __init__(self, rf_path: str, lstm_path: str, preproc_path: str, seq_len: int):
-        self.rf = joblib.load(rf_path)
-        self.lstm = keras.models.load_model(lstm_path)
+    def __init__(
+        self,
+        rf_path: str,
+        lstm_path: str,
+        preproc_path: str,
+        seq_len: int,
+    ):
+        try:
+            # Wczytywanie modeli
+            self.rf = joblib.load(rf_path)
+            self.lstm = keras.models.load_model(lstm_path)
 
-        pre_obj = joblib.load(preproc_path)
-        self.preproc, self.feature_cols = _unwrap_preproc(pre_obj)
+            # --- LOGIKA UNWRAP (zamiast funkcji zewnętrznej) ---
+            # Zmieniamy nazwę zmiennej na 'loaded_data' dla bezpieczeństwa
+            loaded_data = joblib.load(preproc_path)
 
-        self.seq_len = int(seq_len)
+            if isinstance(loaded_data, dict):
+                self.preproc = loaded_data.get("preproc")
+                self.feature_cols = loaded_data.get("feature_cols")
+                if self.preproc is None:
+                    raise TypeError(
+                        "preproc.joblib dict must contain key 'preproc'")
+            else:
+                self.preproc = loaded_data
+                self.feature_cols = None
+            # ---------------------------------------------------
 
-    def predict_parts(self, X_scaled: np.ndarray, X_seq_scaled: np.ndarray | None):
+            self.seq_len = int(seq_len)
+
+            logger.info("[OK] HybridDetector initialized")
+
+        except Exception as e:
+            logger.warning(f"[HybridDetector init failed] {e}")
+            raise  # GUI ma to zobaczyć
+
+    def predict_parts(
+        self,
+        X_scaled: np.ndarray,
+        X_seq_scaled: np.ndarray | None,
+    ):
         """
         Zwraca:
           rf_p_full: (N,)
-          lstm_p_seq: (N-seq_len+1,) lub None
-          meta_p_seq: zawsze None (meta usunięta)
+          lstm_p_seq: (N - seq_len + 1,) lub None
+          meta_p_seq: zawsze None
         """
-        rf_p_full = self.rf.predict_proba(X_scaled)[:, 1].astype(np.float32)
+        try:
+            rf_p_full = self.rf.predict_proba(
+                X_scaled)[:, 1].astype(np.float32)
 
-        if X_seq_scaled is None or len(X_seq_scaled) == 0 or len(rf_p_full) < self.seq_len:
-            return rf_p_full, None, None
+            if (
+                X_seq_scaled is None
+                or len(X_seq_scaled) == 0
+                or len(rf_p_full) < self.seq_len
+            ):
+                return rf_p_full, None, None
 
-        lstm_p_seq = self.lstm.predict(X_seq_scaled, verbose=0).reshape(-1).astype(np.float32)
-        return rf_p_full, lstm_p_seq, None
+            lstm_p_seq = (
+                self.lstm.predict(X_seq_scaled, verbose=0)
+                .reshape(-1)
+                .astype(np.float32)
+            )
 
-    def predict_proba(self, X_scaled: np.ndarray, X_seq_scaled: np.ndarray | None) -> np.ndarray:
-        """
-        Zostawiamy RF jako "OUT", bo docelowy alarm i tak liczysz w workerze jako SCORE (soft-OR).
-        """
+            return rf_p_full, lstm_p_seq, None
+
+        except Exception as e:
+            logger.warning(f"[predict_parts failed] {e}")
+            return (
+                np.zeros(len(X_scaled), dtype=np.float32),
+                None,
+                None,
+            )
+
+    def predict_proba(
+        self,
+        X_scaled: np.ndarray,
+        X_seq_scaled: np.ndarray | None,
+    ) -> np.ndarray:
         rf_p_full, _lstm_p_seq, _ = self.predict_parts(X_scaled, X_seq_scaled)
         return rf_p_full
