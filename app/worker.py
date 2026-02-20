@@ -64,7 +64,8 @@ class IDSWorker(threading.Thread):
         self._ensure_dirs()
 
         # ile cech oczekuje pipeline (diagnostycznie)
-        self.n_expected: Optional[int] = getattr(self.detector.preproc, "n_features_in_", None)
+        self.n_expected: Optional[int] = getattr(
+            self.detector.preproc, "n_features_in_", None)
 
     def stop(self):
         self._stop_evt.set()
@@ -90,8 +91,10 @@ class IDSWorker(threading.Thread):
             "-F", "pcap",
             "-w", out_pcap,
         ]
-        self._log(f"Capturing {self.cfg.capture_seconds}s on iface {self.cfg.interface} ...")
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self._log(
+            f"Capturing {self.cfg.capture_seconds}s on iface {self.cfg.interface} ...")
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
 
     @staticmethod
     def _make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
@@ -99,7 +102,8 @@ class IDSWorker(threading.Thread):
         if n < seq_len:
             return np.empty((0, seq_len, X.shape[1]), dtype=np.float32)
 
-        out = np.zeros((n - seq_len + 1, seq_len, X.shape[1]), dtype=np.float32)
+        out = np.zeros((n - seq_len + 1, seq_len,
+                       X.shape[1]), dtype=np.float32)
         for i in range(n - seq_len + 1):
             out[i] = X[i: i + seq_len]
         return out
@@ -138,7 +142,8 @@ class IDSWorker(threading.Thread):
 
     def run(self):
         if not getattr(self.detector, "feature_cols", None):
-            self._log("ERROR: detector.feature_cols is missing (preproc.joblib must contain feature_cols).")
+            self._log(
+                "ERROR: detector.feature_cols is missing (preproc.joblib must contain feature_cols).")
             return
 
         feature_cols = list(self.detector.feature_cols)
@@ -146,6 +151,9 @@ class IDSWorker(threading.Thread):
 
         while not self._stop_evt.is_set():
             try:
+                # --- POMIAR CZASU START ---
+                t0_start = time.time()
+
                 # 0) czysty batch (1 pcap -> 1 csv)
                 self._reset_batch_dirs()
 
@@ -156,10 +164,12 @@ class IDSWorker(threading.Thread):
                 pcap_path = str(Path(self.cfg.batch_pcap_dir) / pcap_name)
 
                 self._run_dumpcap(pcap_path)
+                t1_capture_done = time.time()  # <--- KONIEC CAPTURE
 
                 # (opcjonalnie) archiwizacja pcap
                 try:
-                    shutil.copy2(pcap_path, str(Path(self.cfg.pcap_dir) / pcap_name))
+                    shutil.copy2(pcap_path, str(
+                        Path(self.cfg.pcap_dir) / pcap_name))
                 except Exception:
                     pass
 
@@ -174,44 +184,64 @@ class IDSWorker(threading.Thread):
                     out_dir=self.cfg.batch_flows_dir,
                     cicflow_lib_dir=p("tools", "cicflowmeter", "lib"),
                 )
+                t2_cic_done = time.time()  # <--- KONIEC JAVA/IO
 
                 # 3) newest csv z batcha
                 csv_path = str(newest_csv(self.cfg.batch_flows_dir))
 
                 # (opcjonalnie) archiwizacja csv
                 try:
-                    shutil.copy2(csv_path, str(Path(self.cfg.flows_dir) / Path(csv_path).name))
+                    shutil.copy2(csv_path, str(
+                        Path(self.cfg.flows_dir) / Path(csv_path).name))
                 except Exception:
                     pass
 
                 # 4) features identycznie jak trening
                 Xdf = self._load_features_for_runtime(csv_path, feature_cols)
                 if len(Xdf) == 0:
-                    self._log(f"WARNING: Empty features after cleaning for {pcap_name}")
+                    self._log(
+                        f"WARNING: Empty features after cleaning for {pcap_name}")
                     continue
 
                 X_raw = Xdf.values.astype(np.float32, copy=False)
-                X_scaled = self.detector.preproc.transform(X_raw).astype(np.float32, copy=False)
+                X_scaled = self.detector.preproc.transform(
+                    X_raw).astype(np.float32, copy=False)
 
                 # 5) sekwencje
                 X_seq = self._make_sequences(X_scaled, self.cfg.seq_len)
 
                 # 6) części + OUT (OUT=RF w detektorze; LSTM osobno)
                 rf_p, lstm_p, _ = self.detector.predict_parts(X_scaled, X_seq)
-                out_p = self.detector.predict_proba(X_scaled, X_seq)
 
                 # 7) SCORE = RF na początku + soft-OR(RF, LSTM) dla części sekwencyjnej
                 score = rf_p.copy()
                 if lstm_p is not None and np.asarray(lstm_p).size > 0 and rf_p.size >= self.cfg.seq_len:
-                    rf_aligned = rf_p[self.cfg.seq_len - 1 :]
+                    rf_aligned = rf_p[self.cfg.seq_len - 1:]
                     m = min(len(rf_aligned), len(lstm_p))
-                    seq_score = self._soft_or(rf_aligned[:m], np.asarray(lstm_p)[:m])
-                    score[self.cfg.seq_len - 1 : self.cfg.seq_len - 1 + m] = seq_score
+                    seq_score = self._soft_or(
+                        rf_aligned[:m], np.asarray(lstm_p)[:m])
+                    score[self.cfg.seq_len -
+                          1: self.cfg.seq_len - 1 + m] = seq_score
+
+                # --- POMIAR CZASU KONIEC ---
+                t4_inference_done = time.time()
+
+                duration_capture = t1_capture_done - t0_start
+                duration_io_java = t2_cic_done - t1_capture_done
+                duration_ai = t4_inference_done - t2_cic_done
+                total_processing_lag = t4_inference_done - t1_capture_done
+
+                self._log(
+                    f"[PERF] Capture: {duration_capture:.2f}s | "
+                    f"Java/IO: {duration_io_java:.2f}s | "
+                    f"AI: {duration_ai:.2f}s | "
+                    f"TOTAL LAG: {total_processing_lag:.2f}s"
+                )
+                # ---------------------------
 
                 # 8) log statystyk
                 self._log(self._stats_line("RF", rf_p))
                 self._log(self._stats_line("LSTM", lstm_p))
-                self._log(self._stats_line("OUT", out_p))
                 self._log(self._stats_line("SCORE", score))
 
                 if score.size == 0:
@@ -236,10 +266,12 @@ class IDSWorker(threading.Thread):
                         "details": f"max idx={idx}, hits={hits}, thr={thr}, K={self.cfg.min_hits}",
                     }
                     self.alert_q.put(alert)
-                    self._log(f"ALERT: score={pmax:.4f} hits={hits} >= K={self.cfg.min_hits}")
+                    self._log(
+                        f"ALERT: score={pmax:.4f} hits={hits} >= K={self.cfg.min_hits}")
 
             except subprocess.CalledProcessError as e:
-                out = getattr(e, "stdout", None) or getattr(e, "output", None) or str(e)
+                out = getattr(e, "stdout", None) or getattr(
+                    e, "output", None) or str(e)
                 self._log(f"ERROR: subprocess failed:\n{out}")
             except Exception as e:
                 self._log(f"ERROR: {type(e).__name__}: {e}")
